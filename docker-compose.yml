@@ -1,0 +1,33 @@
+# Docker Compose for local development and testing
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: notizen
+      POSTGRES_USER: notizen
+      POSTGRES_PASSWORD: notizen
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notizen"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: "postgresql+psycopg://notizen:notizen@db:5432/notizen"
+      LOG_LEVEL: "DEBUG"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - api
