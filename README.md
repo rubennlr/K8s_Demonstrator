@@ -2,8 +2,8 @@
 
 Gruppe: **Ruben Neßler**, **Mario Di Caprio**
 
-Eine simple Notizen-Anwendung mit **FastAPI** (Backend), implementiert nach dem 12-Factor-App-Prinzip und bereitgestellt mit Docker und Kubernetes.
-Außerdem enthält sie eine Technologie (**Prometheus**) aus der [CNCF-Landscape](https://landscape.cncf.io/).
+Eine simple Notizen-Anwendung mit **FastAPI** (Backend) und **React + Vite** (Frontend), implementiert nach dem 12-Factor-App-Prinzip und bereitgestellt mit Docker und Kubernetes.
+Außerdem enthält sie zwei Technologien (**Prometheus** und **Grafana**) aus der [CNCF-Landscape](https://landscape.cncf.io/).
 
 
 ## Projektstruktur
@@ -11,9 +11,10 @@ Außerdem enthält sie eine Technologie (**Prometheus**) aus der [CNCF-Landscape
 | Bereich | Pfad | Techstack |
 |---|---|---|
 | **Backend** | `app/` | FastAPI REST-API + SQLAlchemy |
-| **Infrastruktur** | `Dockerfile` | Docker Multi-Stage Build |
+| **Frontend** | `frontend/` | React + Vite + nginx |
+| **Infrastruktur** | `Dockerfile`, `frontend/Dockerfile` | Docker Multi-Stage Builds |
 | **Kubernetes** | `k8s/` | Kubernetes-Manifeste (Deployments, Services, ConfigMaps, Secrets) |
-| **Monitoring** | `k8s/prometheus-*.yaml` | Prometheus |
+| **Monitoring** | `k8s/prometheus-*.yaml`, `k8s/grafana-*.yaml` | Prometheus + Grafana |
 
 ## Quick Start (lokal)
 
@@ -29,6 +30,16 @@ uvicorn app.main:app --reload
 
 Die API ist unter `http://localhost:8000` erreichbar, die Swagger-Docs unter `http://localhost:8000/docs`.
 
+### Frontend starten
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Das Frontend ist unter `http://localhost:5173` erreichbar und leitet API-Requests via Proxy an das Backend weiter.
+
 ## Docker
 
 ### Images bauen
@@ -36,6 +47,9 @@ Die API ist unter `http://localhost:8000` erreichbar, die Swagger-Docs unter `ht
 ```bash
 # Backend-Image
 docker build -t notizen-api:latest .
+
+# Frontend-Image
+docker build -t notizen-frontend:latest ./frontend
 ```
 
 ### Container starten
@@ -55,6 +69,12 @@ docker run -d --name api \
   -p 8000:8000 \
   --link postgres \
   notizen-api:latest
+
+# Frontend
+docker run -d --name frontend \
+  -p 80:80 \
+  --link api \
+  notizen-frontend:latest
 ```
 
 ## Kubernetes Deployment
@@ -68,11 +88,30 @@ kubectl apply -f k8s/
 kubectl get all -n notizen-app
 ```
 
+### Port-Forwarding
+
+Da die Services im Cluster laufen, wird `kubectl port-forward` verwendet, um sie lokal im Browser zu öffnen:
+
+```bash
+# Frontend (Notizen-App)
+kubectl port-forward -n notizen-app svc/frontend 8080:80
+# -> http://localhost:8080
+
+# Grafana (Monitoring-Dashboard)
+kubectl port-forward -n notizen-app svc/grafana 3000:3000
+# -> http://localhost:3000
+```
+
+### Kommunikation zwischen Frontend und Backend
+
+* Das Frontend (nginx) leitet API-Requests (`/notes`, `/health`, `/metrics`, `/docs`) via `proxy_pass` an den Backend-Service (`api:8000`) weiter. 
+* Die Service-Discovery erfolgt über Kubernetes DNS. Der Service-Name `api` wird innerhalb des Namespaces `notizen-app` automatisch aufgelöst.
+
 ---
 
 ## Struktur der Kubernetes-Manifeste
 
-Im Verzeichnis `k8s/` befinden sich die YAML-Dateien, die zusammen die Infrastruktur der Anwendung im Cluster beschreiben. 
+Im Verzeichnis `k8s/` befinden sich 18 YAML-Dateien, die zusammen die vollständige Infrastruktur der Anwendung im Cluster beschreiben. 
 Im Folgenden wird erklärt, was jede Datei tut und wie die Manifeste zusammenhängen.
 
 ### Übersicht der Dateien
@@ -87,14 +126,20 @@ Im Folgenden wird erklärt, was jede Datei tut und wie die Manifeste zusammenhä
 | `backend-configmap.yaml` | ConfigMap | Enthält die Umgebungsvariablen für das Backend (`DATABASE_URL`, `LOG_LEVEL`) |
 | `backend-deployment.yaml` | Deployment | Startet 2 Replicas des FastAPI-Backends mit der ConfigMap |
 | `backend-service.yaml` | Service (ClusterIP) | Macht das Backend unter dem DNS-Namen `api` im Cluster erreichbar |
+| `frontend-deployment.yaml` | Deployment | Startet 2 Replicas des nginx-Frontends |
+| `frontend-service.yaml` | Service (NodePort) | Macht das Frontend von außerhalb des Clusters erreichbar |
 | `prometheus-configmap.yaml` | ConfigMap | Prometheus-Konfiguration (Scrape-Targets und Intervalle) |
 | `prometheus-deployment.yaml` | Deployment | Startet Prometheus zum Sammeln der Metriken |
 | `prometheus-service.yaml` | Service (ClusterIP) | Macht Prometheus unter dem DNS-Namen `prometheus` erreichbar |
 | `prometheus-servicemonitor.yaml` | ServiceMonitor | Konfiguriert den Prometheus Operator (optional) |
+| `grafana-datasource.yaml` | ConfigMap | Konfiguriert Prometheus als Datenquelle für Grafana |
+| `grafana-dashboard.yaml` | ConfigMap | Enthält ein vorkonfiguriertes Dashboard für die Notizen-API |
+| `grafana-deployment.yaml` | Deployment | Startet Grafana mit automatisch provisionierten Dashboards |
+| `grafana-service.yaml` | Service (NodePort) | Macht Grafana von außerhalb des Clusters erreichbar |
 
 ### Wie die Manifeste zusammenhängen
 
-Die Manifeste bilden eine Abhängigkeitskette, die sich in drei Schichten gliedern lässt:
+Die Manifeste bilden eine Abhängigkeitskette, die sich in vier Schichten gliedern lässt:
 
 #### Schicht 1: Datenbank (PostgreSQL)
 
@@ -122,13 +167,27 @@ backend-configmap.yaml –> backend-deployment.yaml
 
 * Die **ConfigMap** enthält die `DATABASE_URL`, die auf den PostgreSQL-Service verweist (`postgresql+psycopg://notizen:...@postgres:5432/notizen`). 
 * Das Deployment lädt diese Umgebungsvariablen per `envFrom.configMapRef`. Dadurch weiß das Backend, wie es die Datenbank erreicht (der Hostname `postgres` wird über Kubernetes DNS automatisch zum PostgreSQL-Service aufgelöst). 
-* Der **Service** macht das Backend unter dem Namen `api` erreichbar.
+* Der **Service** macht das Backend unter dem Namen `api` für das Frontend erreichbar.
 
 Jeder Backend-Pod hat Health-Checks definiert:
 - **readinessProbe**: Prüft per HTTP-GET auf `/health`, ob der Pod bereit ist, Traffic zu empfangen
 - **livenessProbe**: Prüft regelmäßig, ob der Pod noch lebt, und startet ihn bei Bedarf neu
 
-#### Schicht 3: Monitoring (Prometheus)
+#### Schicht 3: Frontend (nginx)
+
+```
+frontend-deployment.yaml
+         │
+         v
+frontend-service.yaml
+(NodePort - extern erreichbar)
+```
+
+* Das Frontend benötigt keine ConfigMap oder Secrets. Die nginx-Konfiguration (im Docker-Image eingebettet) leitet API-Requests per `proxy_pass` an `http://api:8000` weiter. 
+Der Hostname `api` wird über Kubernetes DNS zum Backend-Service aufgelöst. 
+Der **Service** ist vom Typ `NodePort`, sodass das Frontend von außerhalb des Clusters erreichbar ist.
+
+#### Schicht 4: Monitoring (Prometheus + Grafana)
 
 ```
 prometheus-configmap.yaml ──> prometheus-deployment.yaml
@@ -136,10 +195,44 @@ prometheus-configmap.yaml ──> prometheus-deployment.yaml
                                         v
                                prometheus-service.yaml
                                (DNS: "prometheus:9090")
+                                        │
+                                        v
+grafana-datasource.yaml ──> grafana-deployment.yaml <── grafana-dashboard.yaml
+                                        │
+                                        v
+                               grafana-service.yaml
+                               (NodePort - extern erreichbar)
 ```
 
 * Die **Prometheus-ConfigMap** definiert, welche Targets gescraped werden (hier: `api:8000` alle 30 Sekunden). Prometheus sammelt die Metriken vom `/metrics`-Endpoint des Backends und speichert sie in seiner Zeitreihendatenbank.
+* Die **Grafana-Datasource-ConfigMap** konfiguriert Prometheus automatisch als Datenquelle (`http://prometheus:9090`). Die **Dashboard-ConfigMap** enthält ein vorkonfiguriertes Dashboard mit Panels für Request-Rate, Antwortzeiten (p95), Gesamtzahl der Requests und Fehlerrate.
 * Der **ServiceMonitor** (`prometheus-servicemonitor.yaml`) ist ein optionales Manifest für den Prometheus Operator und wird nur benötigt, wenn dieser im Cluster installiert ist.
+
+### Übersicht - Netzwerk-Kommunikation
+
+```
+                    ┌──────────────────────────────────────────────────┐
+                    │              Namespace: notizen-app              │
+                    │                                                  │
+  Benutzer ──>  NodePort:80                         NodePort:3000      │
+                    │                                    │             │
+                    v                                    v             │
+              ┌───────────┐    /notes     ┌───────────┐  ┌──────────┐  │
+              │  Frontend │ ────────────► │  Backend  │  │  Grafana │  │
+              │  (nginx)  │  proxy_pass   │  (FastAPI)│  │ Dashboards  │
+              │  2 Replica│ ◄──────────── │  2 Replica│  └─────┬────┘  │
+              └───────────┘               └──┬────┬───┘        │       │
+                                             │    │            │       │
+                                    DATABASE_URL  │ /metrics   │       │
+                                             │    │            │       │
+                                             v    v            v       │
+                                       ┌─────────┐    ┌────────────┐   │
+                                       │PostgreSQL│   │ Prometheus │   │
+                                       │ 1 Replica│   |   scrapes  │   │
+                                       │  + PVC   │   │  api:8000  │   │
+                                       └─────────┘    └────────────┘   │
+                    └──────────────────────────────────────────────────┘
+```
 
 ### Deployment-Reihenfolge
 
@@ -165,6 +258,7 @@ Aus dieser einen Codebase können verschiedene Deployments erzeugt werden (lokal
 
 **Umgesetzt.** 
 Alle Backend-Abhängigkeiten sind in `pyproject.toml` mit Versionsbereichen deklariert. 
+Alle Frontend-Abhängigkeiten stehen in `package.json`. 
 Es gibt keine impliziten System-Abhängigkeiten, die Docker-Images enthalten alles Nötige.
 
 ### III. Config 
@@ -184,7 +278,7 @@ Ein Wechsel der Datenbank erfordert nur eine Änderung dieser Variable, nicht de
 ### V. Build, Release, Run 
 
 **Umgesetzt.** Die Multi-Stage Dockerfiles trennen klar:
-1. **Build**: Abhängigkeiten installieren
+1. **Build**: Abhängigkeiten installieren, Frontend kompilieren
 2. **Release**: Docker-Images mit bestimmtem Tag
 3. **Run**: Container starten via `CMD` im Dockerfile
 
@@ -198,27 +292,28 @@ Mehrere Backend-Replicas können parallel laufen (`replicas: 2` im Kubernetes-De
 ### VII. Port Binding 
 
 **Umgesetzt.** 
-Das Backend bindet sich an Port 8000 (`uvicorn --port 8000`). 
-Es exponiert seinen Service vollständig über HTTP.
+Das Backend bindet sich an Port 8000 (`uvicorn --port 8000`), das Frontend an Port 80 (nginx). 
+Beide exponieren ihren Service vollständig über HTTP.
 
 ### VIII. Concurrency 
 
 **Umgesetzt.** 
-Die Kubernetes-Deployments definieren `replicas: 2` für das Backend. 
+Die Kubernetes-Deployments definieren `replicas: 2` für Backend und Frontend. 
 Skalierung erfolgt so horizontal über weitere Pod-Replicas.
 
 ### IX. Disposability 
 
 **Umgesetzt.** 
-Die Container starten schnell (schlanke Python-Images). 
+Die Container starten schnell (schlanke Python/nginx-Images). 
 Health-Checks (`/health`) ermöglichen Kubernetes, nicht-bereite Pods zu entfernen. 
 Liveness- und Readiness-Probes sind definiert.
 
 ### X. Dev/prod parity 
 
 **Umgesetzt.** 
-Lokal wird SQLite verwendet, in Produktion PostgreSQL, aber der Code bleibt identisch (SQLAlchemy als Abstraktion). 
-Docker-Images sind in beiden Umgebungen die gleichen.
+* Lokal wird SQLite verwendet, in Produktion PostgreSQL, aber der Code bleibt identisch (SQLAlchemy als Abstraktion). 
+* Docker-Images sind in beiden Umgebungen die gleichen. 
+* Die Vite-Proxy-Konfiguration bildet das nginx-Routing lokal nach.
 
 ### XI. Logs 
 
@@ -230,7 +325,7 @@ In Kubernetes werden diese von der Container-Runtime eingesammelt und können an
 
 **Teilweise umgesetzt.**  
 Aktuell wird das DB-Schema automatisch beim Start erstellt (`Base.metadata.create_all`). 
-Für eine produktive Anwendung könnten die Datenbank-Migrationen als Kubernetes-Jobs ausgeführt werden, z.B. indem man Alembic-Migrationen als Init-Container oder Job ausführt.
+Für eine produktive Anwendung könnten die Datenbank-Migrationen könnten als Kubernetes-Jobs ausgeführt werden, z.B. indem man Alembic-Migrationen als Init-Container oder Job ausführt.
 
 ---
 
@@ -312,3 +407,58 @@ Der `ServiceMonitor` (`k8s/prometheus-servicemonitor.yaml`) ist ein optionales M
 - **Skalierbarkeit**: Funktioniert mit beliebig vielen Backend-Replicas
 - **Alerting**: Auf Basis der Metriken können Alerts definiert werden (z.B. bei hoher Latenz oder Fehlerrate)
 - **Visualisierung**: Die gesammelten Metriken lassen sich in Grafana (ebenfalls Teil der CNCF) als Dashboards darstellen
+
+---
+
+## 2. CNCF-Technologie: Grafana
+
+[Grafana](https://grafana.com/) ist eine Open-Source-Plattform für Monitoring und Observability, die ebenfalls Teil der [CNCF](https://www.cncf.io/) ist. 
+Grafana ermöglicht die Visualisierung von Metriken, Logs und Traces aus verschiedenen Datenquellen in konfigurierbaren Dashboards.
+
+### Einsatz im Projekt
+
+Grafana wird im Cluster als eigener Pod betrieben und ist über einen NodePort-Service von außen erreichbar. 
+Die Konfiguration erfolgt automatisiert über Kubernetes-ConfigMaps (Provisioning):
+
+#### Automatische Datenquellen-Konfiguration
+
+Über die ConfigMap `grafana-datasource.yaml` wird Prometheus beim Start automatisch als Datenquelle registriert:
+```yaml
+datasources:
+  - name: Prometheus
+    type: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+```
+
+Grafana erreicht Prometheus über den Kubernetes-Service-DNS-Namen `prometheus:9090`.
+
+#### Vorkonfiguriertes Dashboard
+
+Die ConfigMap `grafana-dashboard.yaml` enthält ein JSON-Dashboard, das beim Start automatisch geladen wird. Es enthält vier Panels:
+
+* Request Rate: Requests pro Sekunde, aufgeschlüsselt nach Methode, Endpoint und Status
+* Request Duration (p95): 95. Perzentil der Antwortzeiten
+* Total Requests: Gesamtanzahl aller bisherigen Requests
+* Error Rate: Anteil der 5er-Fehler in Prozent
+
+#### Zugang
+
+Da Grafana als ClusterIP/NodePort-Service im Cluster läuft, wird `kubectl port-forward` verwendet, um das Dashboard lokal im Browser zu öffnen:
+
+```bash
+# Port-Forward starten
+kubectl port-forward -n notizen-app svc/grafana 3000:3000
+
+# Grafana dann erreichbar unter:
+# http://localhost:3000
+```
+
+Der anonyme Lesezugriff ist aktiviert (`GF_AUTH_ANONYMOUS_ENABLED=true`), sodass Dashboards ohne Login eingesehen werden können. Das vorkonfigurierte Dashboard findet sich unter: 
+**Menü (links) –> Dashboards –> Notizen API**
+
+### Warum Grafana im Projektkontext sinnvoll ist
+
+- **Ergänzung zu Prometheus**: Prometheus sammelt und speichert Metriken, Grafana visualisiert sie 
+- **Automatisiertes Setup**: Durch Provisioning über ConfigMaps wird Grafana vollständig deklarativ konfiguriert
+- **CNCF-Ökosystem**: Grafana und Prometheus sind das Standard-Monitoring-Duo in Cloud-Native-Umgebungen und werden häufig gemeinsam eingesetzt
